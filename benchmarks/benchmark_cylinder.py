@@ -189,7 +189,7 @@ def main(argv=None):
     # Use fixed, non-configurable run parameters per user request
     # CSV name, number of repeats and random seed are fixed and cannot be overridden from CLI
     # write results to a fixed subfolder and filename
-    OUT_FILENAME = os.path.join('results', 'benchmark.csv')
+    OUT_FILENAME = os.path.join('benchmarks','csv_y_vis','benchmark.csv')
     REPEATS = 3
     RANDOM_STATE = 42
 
