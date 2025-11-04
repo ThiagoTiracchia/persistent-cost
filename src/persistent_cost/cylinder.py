@@ -277,7 +277,7 @@ def step4(D_f, V_g, R_g, mapping_L):
     print(len(rows_not_in_L), "rows not in L")
     print(len(index_cycle_columns_f), "cycle columns to process in cokernel step")
 
-    embed()
+    #embed()
 
     for j_idx, (idx_f, idx_g) in enumerate(zip(index_cycle_columns_f, cycle_columns)):        
 
