@@ -261,7 +261,7 @@ def step4(D_f, V_g, R_g, mapping_L):
     """
 
     # Copia en formato lil para facilitar asignaciones
-    D_cok = D_f.tolil()
+    D_cok = D_f.tolil() ## nota thiago: esto capaz me rompe el medir el tiempo de ejecucion segun el tipo?
 
     # Columnas de R_g que son ciclos (columnas con todo cero)
     cycle_columns = [c for c in range(R_g.shape[1]) if R_g[:, c].getnnz() == 0]
