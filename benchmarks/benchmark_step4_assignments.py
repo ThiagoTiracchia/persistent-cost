@@ -16,261 +16,230 @@ except Exception as e:
     do_pivot = None
 
 
+def _col_dense_from_Vg(V_g, idx_g):
+    """Devuelve vector 1D numpy con la columna idx_g de V_g (compatible con sparse/dense V_g)."""
+    if hasattr(V_g, "tocsc"):
+        return V_g[:, idx_g].toarray().ravel()
+    else:
+        return np.asarray(V_g[:, idx_g]).ravel()
+
+
+def _build_full_col_coo(n_rows, n_cols, idx_f, col_data, rows_indices=None):
+    """
+    Construye una matriz COO del tamaño (n_rows, n_cols) que contiene únicamente la columna idx_f,
+    con entradas en rows_indices (o todas si rows_indices is None) donde col_data != 0.
+    Se omiten explícitamente los ceros (para que la adición/substracción elimine entradas previas).
+    """
+    if rows_indices is None:
+        rows = np.arange(n_rows, dtype=int)
+        vals = np.asarray(col_data)
+    else:
+        rows = np.asarray(rows_indices, dtype=int)
+        vals = np.asarray(col_data)[rows_indices]
+
+    mask = vals != 0
+    if mask.sum() == 0:
+        # columna vacía
+        return sp.coo_matrix((n_rows, n_cols))
+    rows_nz = rows[mask]
+    vals_nz = vals[mask]
+    cols_nz = np.full(len(rows_nz), idx_f, dtype=int)
+    return sp.coo_matrix((vals_nz, (rows_nz, cols_nz)), shape=(n_rows, n_cols))
+
+
 def benchmark_assignments(D_f, V_g, R_g, mapping_L, formato_test='lil'):
     """
-    Benchmarkea específicamente las asignaciones elemento por elemento de step4.
-    
-    Basado en step4 de cylinder.py, mide el tiempo y memoria de las asignaciones,
-    y luego cuenta qué tipo de asignaciones se hicieron.
-    
-    Args:
-        D_f: Matriz dispersa del complejo K
-        V_g: Matriz de transformación de D_g
-        R_g: Matriz reducida de D_g
-        mapping_L: Lista de índices de COLUMNAS en D_f correspondientes a L
-        formato_test: Formato de matriz a usar para D_cok ('lil', 'dok', 'csr', 'csc')
-    
-    Returns:
-        dict con métricas del benchmark
+    Benchmark del paso de asignaciones del cokernel,
+    usando las implementaciones eficientes definitivas.
     """
-    
-    # Métricas iniciales
+    from scipy import sparse
+    from scipy.sparse import csc_matrix, lil_matrix, dok_matrix
+    # ================================
+    # MÉTRICAS INICIALES
+    # ================================
     nnz_before = D_f.getnnz()
-    
-    # Copia en formato especificado para las asignaciones
+
+    # Copia según formato
     if formato_test == 'lil':
         D_cok = D_f.tolil()
-    elif formato_test == 'dok':
-        D_cok = D_f.todok()
-    elif formato_test == 'csr':
-        D_cok = D_f.tocsr() # Conversión intermedia para asignaciones
-    elif formato_test == 'csc':
-        D_cok = D_f.tocsc()  # Conversión intermedia para asignaciones
-    else:
+    elif formato_test == 'step4':
         D_cok = D_f.tolil()
+    elif formato_test == 'csc':
+        D_cok = D_f.tocsc()
+    else:
+        raise ValueError("Formato desconocido")
+    
+    total_rows, total_cols = D_f.shape
 
-    # Snapshot de coordenadas existentes ANTES de las asignaciones
+    
+    cycle_columns = [c for c in range(R_g.shape[1]) if R_g[:, c].getnnz() == 0]
+    cycle_columns = [c for c in cycle_columns if c < len(mapping_L)]
+    index_cycle_columns_f = [mapping_L[c] for c in cycle_columns]
+    rows_in_L = np.array(list(mapping_L)) 
+    # rows_not_in_L = np.setdiff1d(np.arange(total_rows), rows_in_L) # Opcional si usamos máscara
+    total_rows = D_f.shape[0]
+    rows_in_L = [i for i in range(total_rows) if i in mapping_L]
+    rows_not_in_L = [i for i in range(total_rows) if i not in rows_in_L]    
+    # Snapshot para clasificar asignaciones
     existing_coords_before = set()
     D_f_coo = D_f.tocoo()
     for i, j in zip(D_f_coo.row, D_f_coo.col):
         existing_coords_before.add((int(i), int(j)))
 
-    # Columnas de R_g que son ciclos (columnas con todo cero)
-    cycle_columns = [c for c in range(R_g.shape[1]) if R_g[:, c].getnnz() == 0]
+    # A qué columnas de D_f corresponde cada columna ciclo
+    index_cycle_columns_f = [mapping_L[c] for c in cycle_columns]
 
-    # Índices en D_f correspondientes a esas columnas de ciclos
-    index_cycle_columns_f = [mapping_L[c] for c in cycle_columns if c < len(mapping_L)]
+    n_rows = D_f.shape[0]
 
-    # Usamos todas las filas para este benchmark (filas sobre las que aplicamos V_g)
-    total_rows = D_f.shape[0]
-    rows_in_L = list(range(total_rows))
-    rows_not_in_L = []
+    # ================================
+    #   PASO 1: ASIGNACIONES
+    # ================================
+    tracemalloc.start()
+    t0 = time.perf_counter()
 
+    # ------------------------------------------------------------
+    # IMPLEMENTACIÓN 1: step4
+    # ------------------------------------------------------------
+    if formato_test == "step4":
+        for j_idx, (idx_f, idx_g) in enumerate(zip(index_cycle_columns_f, cycle_columns)):        
 
-    ## quiero testerar que pasa   
-    if formato_test in ('csr', 'csc'):
-        tracemalloc.start()
-        t0 = time.perf_counter()
-
-        for idx_f, idx_g in zip(index_cycle_columns_f, cycle_columns):
-            # Obtener columna de V_g (densa)
+        # Poner en filas de L la columna correspondiente de V_g
+            # Aseguramos que V_g esté en formato compatible (dense o sparse)
             if hasattr(V_g, "tocsc"):
                 col_data = V_g[:, idx_g].toarray().ravel()
             else:
-                col_data = np.asarray(V_g[:, idx_g]).ravel()
+                col_data = V_g[:, idx_g]
 
-             # Crear una columna dispersa con todos los valores
-            n_rows = D_cok.shape[0]
-            col_sparse = sp.csc_matrix(
-                (col_data, (np.arange(n_rows), np.zeros(n_rows, dtype=int))),
-                shape=(n_rows, 1)
-            )
-
-        # Asignar toda la columna de una vez (sin bucle)
-            D_cok[:, idx_f] = col_sparse
-
-        t1 = time.perf_counter()
-        current, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-
-        total_time = t1 - t0
-
-        # --- PASO 2: reconstruir las asignaciones hechas (sin afectar medición)
-        assignments_list = []
-        for idx_f, idx_g in zip(index_cycle_columns_f, cycle_columns):
-            if hasattr(V_g, "tocsc"):
-                col_data = V_g[:, idx_g].toarray().ravel()
-            else:
-                col_data = np.asarray(V_g[:, idx_g]).ravel()
-
-            for row_idx, val in enumerate(col_data):
-                assignments_list.append((int(row_idx), int(idx_f), float(val)))
-
-        total_assignments = len(assignments_list)
-
-        # Clasificar asignaciones: existentes vs nuevas (según snapshot inicial)
-        assignments_to_existing = 0
-        assignments_to_new = 0
-        for row_idx, col_idx, val in assignments_list:
-            if (row_idx, col_idx) in existing_coords_before:
-                assignments_to_existing += 1
-            else:
-                assignments_to_new += 1
-
-        # Contar asignaciones que escriben 0
-        assignments_by_zero = sum(1 for _, _, val in assignments_list if val == 0)
-
-        # Métricas finales
-        nnz_after = D_cok.getnnz()
-
-        return {
-            'fmt': formato_test,
-            'tiempo_asignaciones_s': float(total_time),
-            'memoria_pico_mib': float(peak) / (1024 * 1024),
-            'total_asignaciones': int(total_assignments),
-            'asignaciones_a_existentes': int(assignments_to_existing),
-            'asignaciones_a_nuevas': int(assignments_to_new),
-            'asignaciones_por_cero': int(assignments_by_zero),
-            'nnz_antes': int(nnz_before),
-            'nnz_despues': int(nnz_after),
-            'ciclos_procesados': int(len(index_cycle_columns_f)),
-            'filas_en_L': int(len(rows_in_L)),
-            'filas_no_en_L': int(len(rows_not_in_L)),
-        }
-    elif formato_test == 'dok':
-        tracemalloc.start()
-        t0 = time.perf_counter()
-
-        # --- PASO 1: Asignaciones eficientes sobre DOK
-        for idx_f, idx_g in zip(index_cycle_columns_f, cycle_columns):
-            # Obtener columna de V_g (densa)
-            if hasattr(V_g, "tocsc"):
-                col_data = V_g[:, idx_g].toarray().ravel()
-            else:
-                col_data = np.asarray(V_g[:, idx_g]).ravel()
-
-            # Asignar solo valores distintos de cero (DOK es un dict → O(1) por asignación)
-            for row_idx, val in enumerate(col_data):
-                if val != 0:
-                    D_cok[row_idx, idx_f] = val
-                elif (row_idx, idx_f) in D_cok:
-                    # Si el valor es cero y existía antes, lo eliminamos
-                    del D_cok[row_idx, idx_f]
-
-        t1 = time.perf_counter()
-        current, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-
-        total_time = t1 - t0
-
-        # --- PASO 2: reconstruir las asignaciones hechas (sin afectar medición)
-        assignments_list = []
-        for idx_f, idx_g in zip(index_cycle_columns_f, cycle_columns):
-            if hasattr(V_g, "tocsc"):
-                col_data = V_g[:, idx_g].toarray().ravel()
-            else:
-                col_data = np.asarray(V_g[:, idx_g]).ravel()
-
-            for row_idx, val in enumerate(col_data):
-                assignments_list.append((int(row_idx), int(idx_f), float(val)))
-
-        total_assignments = len(assignments_list)
-
-        # Clasificar asignaciones: existentes vs nuevas (según snapshot inicial)
-        assignments_to_existing = 0
-        assignments_to_new = 0
-        for row_idx, col_idx, val in assignments_list:
-            if (row_idx, col_idx) in existing_coords_before:
-                assignments_to_existing += 1
-            else:
-                assignments_to_new += 1
-
-        # Contar asignaciones que escriben 0
-        assignments_by_zero = sum(1 for _, _, val in assignments_list if val == 0)
-
-        # Métricas finales
-        nnz_after = D_cok.getnnz()
-
-        return {
-            'fmt': formato_test,
-            'tiempo_asignaciones_s': float(total_time),
-            'memoria_pico_mib': float(peak) / (1024 * 1024),
-            'total_asignaciones': int(total_assignments),
-            'asignaciones_a_existentes': int(assignments_to_existing),
-            'asignaciones_a_nuevas': int(assignments_to_new),
-            'asignaciones_por_cero': int(assignments_by_zero),
-            'nnz_antes': int(nnz_before),
-            'nnz_despues': int(nnz_after),
-            'ciclos_procesados': int(len(index_cycle_columns_f)),
-            'filas_en_L': int(len(rows_in_L)),
-            'filas_no_en_L': int(len(rows_not_in_L)),
-        }
-    else:
-            
-    ## quiero testerar que pasa    
-    # --- PASO 1: ejecutar for de asignaciones y medir su tiempo (sin contabilizar)
-        tracemalloc.start()
-        t0 = time.perf_counter()
-
-        for idx_f, idx_g in zip(index_cycle_columns_f, cycle_columns):
-            # Obtener columna de V_g (densa)
-            if hasattr(V_g, "tocsc"):
-                col_data = V_g[:, idx_g].toarray().ravel()
-            else:
-                col_data = np.asarray(V_g[:, idx_g]).ravel()
-
-            # Asignar en todas las filas (operación que queremos medir)
-            for row_idx, val in enumerate(col_data):
+            for row_idx, val in zip(rows_in_L, col_data):
                 D_cok[row_idx, idx_f] = val
 
-        t1 = time.perf_counter()
-        current, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
+            # En filas no L poner cero
+            for row_idx in rows_not_in_L:
+                D_cok[row_idx, idx_f] = 0
 
-        total_time = t1 - t0
+        # Convertir a formato CSR para operaciones eficientes
+        D_cok = D_cok.tocsr()
+        # Pre-calcular slice para rows_not_in_L es costoso, mejor poner todo a 0 y re-escribir
+        # O usar mask booleana
+        mask_in_L = np.zeros(total_rows, dtype=bool)
+        mask_in_L[rows_in_L] = True
 
-        # --- PASO 2: reconstruir las asignaciones hechas (sin afectar medición)
-        assignments_list = []
+    # ------------------------------------------------------------
+    # IMPLEMENTACIÓN 2: DOK (solo escribir nonzeros y borrar ceros)
+    # ------------------------------------------------------------
+    elif formato_test == "lil":
+        mask_in_L = np.zeros(total_rows, dtype=bool)
+        mask_in_L[rows_in_L] = True
+        rows_not_L_indices = np.where(~mask_in_L)[0]
         for idx_f, idx_g in zip(index_cycle_columns_f, cycle_columns):
-            if hasattr(V_g, "tocsc"):
+        # 1. Obtener columna completa
+            if sparse.issparse(V_g):
                 col_data = V_g[:, idx_g].toarray().ravel()
             else:
                 col_data = np.asarray(V_g[:, idx_g]).ravel()
 
-            for row_idx, val in enumerate(col_data):
-                assignments_list.append((int(row_idx), int(idx_f), float(val)))
+            # 2. REPLICAR LOGICA step4: Tomar los primeros N elementos
+            # donde N es la cantidad de filas en L.
+            n_limit = len(rows_in_L)
+            
+            # Cuidado: zip se detiene en el más corto. 
+            limit = min(n_limit, len(col_data))
+            
+            vals_to_assign = col_data[:limit]     # <--- AQUÍ ESTÁ LA CLAVE (Posicional)
+            target_rows = rows_in_L[:limit]       # <--- Filas destino secuenciales
 
-        total_assignments = len(assignments_list)
+            # Asignación vectorizada
+            D_cok[target_rows, idx_f] = vals_to_assign
+            
+            # Poner ceros en el resto (filas NO en L)
+            # Manera rápida en LIL: setear columna a 0 primero? No, perderíamos lo de arriba.
+            # Lo hacemos con máscara inversa
+            # (Esto es lento en bucle, pero necesario para replicar exactitud si hay basura previa)
+            # Una forma rápida:
+            # matriz_lil[~mask_in_L, idx_f] = 0  <-- Lento en LIL si mask es grande
+            pass 
+        
+        rows_not_L_indices = np.where(~mask_in_L)[0]
+        if len(rows_not_L_indices) > 0:
+            # LIL soporta esto decentemente
+            for idx_f in index_cycle_columns_f:
+                D_cok[rows_not_L_indices, idx_f] = 0
 
-        # Clasificar asignaciones: existentes vs nuevas (según snapshot inicial)
-        assignments_to_existing = 0
-        assignments_to_new = 0
-        for row_idx, col_idx, val in assignments_list:
-            if (row_idx, col_idx) in existing_coords_before:
-                assignments_to_existing += 1
-            else:
-                assignments_to_new += 1
+        D_cok = D_cok.tocsc()
+    # ------------------------------------------------------------
+    # IMPLEMENTACIÓN 3: CSC
+    # ------------------------------------------------------------
+    elif formato_test == "csc":
+      
+      for idx_f, idx_g in zip(index_cycle_columns_f, cycle_columns):
+        if sparse.issparse(V_g):
+            col_data = V_g[:, idx_g].toarray().ravel()
+        else:
+            col_data = np.asarray(V_g[:, idx_g]).ravel()
 
-        # Contar asignaciones que escriben 0
-        assignments_by_zero = sum(1 for _, _, val in assignments_list if val == 0)
+        # Lógica step4: Primeros N valores
+        limit = min(len(rows_in_L), len(col_data))
+        vals = col_data[:limit]
+        rows = rows_in_L[:limit]
+        
+        # Construir columna esparsa nueva
+        # Todo lo que no esté en 'rows' será implícitamente 0 (que es lo que step4 hace con rows_not_in_L)
+        new_col = csc_matrix((vals, (rows, np.zeros(limit))), shape=(total_rows, 1))
+        
+        D_cok[:, idx_f] = new_col
 
-        # Métricas finales
-        nnz_after = D_cok.getnnz()
 
-        return {
-            'fmt': formato_test,
-            'tiempo_asignaciones_s': float(total_time),
-            'memoria_pico_mib': float(peak) / (1024 * 1024),
-            'total_asignaciones': int(total_assignments),
-            'asignaciones_a_existentes': int(assignments_to_existing),
-            'asignaciones_a_nuevas': int(assignments_to_new),
-            'asignaciones_por_cero': int(assignments_by_zero),
-            'nnz_antes': int(nnz_before),
-            'nnz_despues': int(nnz_after),
-            'ciclos_procesados': int(len(index_cycle_columns_f)),
-            'filas_en_L': int(len(rows_in_L)),
-            'filas_no_en_L': int(len(rows_not_in_L)),
-        }
+    else:
+        raise ValueError("Formato inválido")
+
+    t1 = time.perf_counter()
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    total_time = t1 - t0
+
+    # ================================
+    #   PASO 2: Reconstrucción
+    # ================================
+    assignments_list = []
+    for idx_f, idx_g in zip(index_cycle_columns_f, cycle_columns):
+
+        col_data = (
+            V_g[:, idx_g].toarray().ravel()
+            if hasattr(V_g, "tocsc")
+            else np.asarray(V_g[:, idx_g]).ravel()
+        )
+
+        for row_idx, val in enumerate(col_data):
+            assignments_list.append((int(row_idx), int(idx_f), float(val)))
+
+    total_assignments = len(assignments_list)
+
+    # clasificación
+    assignments_to_existing = sum(
+        (r, c) in existing_coords_before for r, c, _ in assignments_list
+    )
+    assignments_to_new = total_assignments - assignments_to_existing
+    assignments_by_zero = sum(val == 0 for _, _, val in assignments_list)
+
+    nnz_after = D_cok.getnnz()
+
+    # ================================
+    # DEVOLVER RESULTADOS
+    # ================================
+    return {
+        'fmt': formato_test,
+        'tiempo_asignaciones_s': float(total_time),
+        'memoria_pico_mib': float(peak) / (1024 * 1024),
+        'total_asignaciones': int(total_assignments),
+        'asignaciones_a_existentes': int(assignments_to_existing),
+        'asignaciones_a_nuevas': int(assignments_to_new),
+        'asignaciones_por_cero': int(assignments_by_zero),
+        'nnz_antes': int(nnz_before),
+        'nnz_despues': int(nnz_after),
+        'ciclos_procesados': int(len(index_cycle_columns_f)),
+    }
+
 
 def run_single_benchmark_synthetic(n_rows, n_cols, n_nnz_df, formato_test='lil', repeats=20, random_state=42):
     """
@@ -391,7 +360,7 @@ def main():
     # Diferentes densidades (porcentajes del total de elementos)
     density_percentages = [0.01, 0.05, 0.1, 0.5, 1.0]
     
-    formatos_test = ['lil', 'dok', 'csr', 'csc']
+    formatos_test = ['lil', 'step4', 'csc']
 
     fieldnames = [
         'n_rows', 'n_cols', 'n_nnz_df', 'density_ratio', 'fmt',

@@ -60,7 +60,7 @@ def random_sparse_matrix(n_rows, n_cols, cant_nonzeros, formato_matriz='csc', ra
         return coo.todok()
     if fmt == 'csr':
         return coo.tocsr()
-    raise ValueError(f"Formato desconocido: {formato_matriz}")
+  
 
 
 def measure_call(func, repeats, *args, **kwargs):
@@ -102,10 +102,11 @@ def run_single_experiment(n_rows, n_cols, formato_matriz, cant_nonzeros, p, repe
     D_g = random_sparse_matrix(n_rows, p, max(1, int(0.005 * n_rows * p)), formato_matriz=formato_matriz, random_state=rs.randint(0, 2**31))
 
     # mapping_L: lista de longitud p con índices destino en D_f
-    if p > n_cols:
-        mapping_L = [int(x) for x in rs.randint(0, n_cols, size=p)]
-    else:
-        mapping_L = [int(x) for x in rs.choice(n_cols, size=p, replace=False)]
+    # mapping_L[c] indica la columna de D_f correspondiente a la columna c en R_g/V_g.
+    # Cuando p <= n_cols tomamos una selección sin reemplazo (columnas distintas).
+    # Cuando p > n_cols permitimos reemplazo para generar p entradas.
+    replace = p > n_cols
+    mapping_L = [int(x) for x in rs.choice(n_cols, size=p, replace=replace)]
 
     record = {
         'n_rows': n_rows,
